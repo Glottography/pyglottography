@@ -1,0 +1,26 @@
+# Releasing the dataset
+
+In case of upstream changes in glottography-data:
+```shell
+cldfbench download cldfbench_{id}.py
+```
+
+```shell
+cldfbench makecldf cldfbench_{id}.py --glottolog-version v5.1
+```
+
+```shell
+cldf validate cldf
+```
+
+```shell
+cldfbench cldfreadme cldfbench_{id}.py
+```
+
+```shell
+cldfbench zenodo cldfbench_{id}.py
+```
+
+```shell
+cldfbench readme cldfbench_{id}.py
+```
