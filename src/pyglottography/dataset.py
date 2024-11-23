@@ -7,16 +7,17 @@ import subprocess
 import collections
 import dataclasses
 
-from shapely import simplify
-from shapely.geometry import shape, Point, MultiPolygon, Polygon
+from shapely import simplify, make_valid
+from shapely.geometry import shape, Point, MultiPolygon, Polygon, GeometryCollection
 from pybtex.database import parse_file
 from clldutils.path import ensure_cmd
-from clldutils.jsonlib import dump, update_ordered
+from clldutils.jsonlib import update_ordered, load
 from clldutils.misc import slug
 from clldutils.markup import add_markdown_text
 import cldfbench
 from csvw.dsv import UnicodeWriter, reader
 from cldfgeojson import MEDIA_TYPE, aggregate, feature_collection, merged_geometry
+from cldfgeojson.geojson import dump
 from pycldf.sources import Sources, Source
 
 OBSOLETE_PROPS = ['reference', 'map_image_file', 'url']
@@ -30,12 +31,33 @@ def get_one_source(p, bibkey=None):
     :return:
     """
     bib = parse_file(str(p), 'bibtex')
-    assert len(bib.entries) == 1
+    # assert len(bib.entries) == 1
     for key, entry in bib.entries.items():
         return Source.from_entry(bibkey or key, entry), key
 
 
+def valid_geometry(geometry):
+    shp = shape(geometry)
+    if not shp.is_valid:  # We fix invalid geometries.
+        res = make_valid(shp)
+        if isinstance(res, GeometryCollection):
+            # The way shapely fixes MultiPolygon geomtries sometimes results in a
+            # GeometryCollection - the "main" geometry, and some things that may be
+            # pruned, like LineStrings or tiny Polygons.
+            res = [
+                s for s in res.geoms
+                if isinstance(s, (Polygon, MultiPolygon)) and s.area > 1e-15]
+            assert len(res) == 1
+            res = res[0]
+        assert isinstance(res, (Polygon, MultiPolygon)) and res.is_valid
+        geometry = res.__geo_interface__
+    return geometry
+
+
 class Feature(dict):
+    """
+    A (readonly) GeoJSON feature dict with syntactic sugar to access shape and properties.
+    """
     @functools.cached_property
     def shape(self):
         return shape(self['geometry'])
@@ -61,6 +83,7 @@ class FeatureSpec:
     """
     id: str
     name: str
+    year: str
     glottocode: typing.Optional[str]
     properties: collections.OrderedDict
 
@@ -69,6 +92,7 @@ class FeatureSpec:
         return cls(
             id=row.pop('id'),
             name=row.pop('name'),
+            year=row.pop('year'),
             glottocode=row.pop('glottocode') or None,
             properties=row,
         )
@@ -87,6 +111,8 @@ class Dataset(cldfbench.Dataset):
     """
     An augmented `cldfbench.Dataset`
     """
+    _sdir = None
+
     @functools.cached_property
     def feature_inventory_path(self):
         return self.etc_dir / 'features.csv'
@@ -94,9 +120,11 @@ class Dataset(cldfbench.Dataset):
     @property
     def feature_inventory(self):
         if self.feature_inventory_path.exists():
-            return [
-                FeatureSpec.from_row(row)
-                for row in reader(self.feature_inventory_path, dicts=True)]
+            res = collections.OrderedDict()
+            for row in reader(self.feature_inventory_path, dicts=True):
+                spec = FeatureSpec.from_row(row)
+                res[spec.id] = spec
+            return res
 
     @feature_inventory.setter
     def feature_inventory(self, value):
@@ -109,13 +137,15 @@ class Dataset(cldfbench.Dataset):
                 writer.writerow(row.values())
 
     def iter_features(self):
-        md = {p.id: p for p in self.feature_inventory}
         for f in self.raw_dir.read_json('dataset.geojson')['features']:
             fid = f['properties']['id']
-            gc = md[fid].glottocode
-            if gc:
-                f['properties']['cldf:languageReference'] = gc
-            yield (fid, Feature(f), gc)
+            spec = self.feature_inventory[fid]
+            assert f['properties']['name'] == spec.name
+            f['properties']['year'] = spec.year
+            if spec.glottocode:
+                f['properties']['cldf:languageReference'] = spec.glottocode
+            f['properties'].update(spec.properties)
+            yield (fid, Feature(f), spec.glottocode)
 
     @functools.cached_property
     def features(self):
@@ -139,7 +169,7 @@ class Dataset(cldfbench.Dataset):
         # turn geopackage into geojson
         # turn polygon list into etc/polygons.csv
         # make sure list is complete and polygons are valid.
-        sdir = self.dir.parent / 'glottography-data' / self.id
+        sdir = self.dir.parent / 'glottography-data' / (self._sdir or self.id)
         if not sdir.exists():
             for d in self.dir.parent.joinpath('glottography-data').iterdir():
                 if d.is_dir() and slug(d.name) == self.id:
@@ -183,8 +213,10 @@ class Dataset(cldfbench.Dataset):
                 for prop in OBSOLETE_PROPS:
                     f['properties'].pop(prop, None)
                 features[f['properties']['id']] = f
+                f['geometry'] = valid_geometry(f['geometry'])
 
-        geometries = [shape(f['geometry']) for f in features.values()]
+        geometries = [
+            shape(f['geometry']) for f in load(self.raw_dir / 'dataset.geojson')['features']]
         assert all(isinstance(p, (Polygon, MultiPolygon)) for p in geometries)
         assert all(p.is_valid for p in geometries)
 
@@ -203,7 +235,7 @@ class Dataset(cldfbench.Dataset):
             self.feature_inventory = res
 
         # Make sure the geo-data matches the CSV feature inventory:
-        assert set(features.keys()) == {f.id for f in self.feature_inventory}
+        assert set(features.keys()) == set(self.feature_inventory.keys())
 
     def cmd_makecldf(self, args):
         # Write three sets of shapes:
@@ -211,7 +243,6 @@ class Dataset(cldfbench.Dataset):
         #    fine-grained Glottocode(s) as available.
         # 2. The shapes aggregated by language-level Glottocodes.
         # 3. The shapes aggregated by family-level Glottocodes.
-
         self.schema(args.writer.cldf)
 
         args.writer.cldf.add_sources(*Sources.from_file(self.etc_dir / "sources.bib"))
@@ -225,14 +256,16 @@ class Dataset(cldfbench.Dataset):
                 Source=[self.id],
                 Media_ID='features',
                 Map_Name=f.properties['map_name_full'],
+                Year=self.feature_inventory[pid].year,
             ))
-        dump(dict(
-            type='FeatureCollection',
-            properties={
-                'dc:description': self.metadata.description,
-                'dc:isPartOf': self.metadata.title,
-            },
-            features=features), self.cldf_dir / 'features.geojson')
+        dump(
+            feature_collection(
+                features,
+                **{
+                    'description': self.metadata.description,
+                    'dc:isPartOf': self.metadata.title,
+                }),
+            self.cldf_dir / 'features.geojson')
         args.writer.objects['MediaTable'].append(dict(
             ID='features',
             Name='Areas depicted in the source',
@@ -256,8 +289,7 @@ class Dataset(cldfbench.Dataset):
                     title='Speaker areas for {}'.format(label),
                     description='Speaker areas aggregated for Glottolog {}-level languoids, '
                     'color-coded by family.'.format(ptype)),
-                p,
-                indent=2)
+                p)
             for (glang, pids, family), f in zip(languages, features):
                 if lids is None or (glang.id not in lids):  # Don't append isolates twice!
                     args.writer.objects['LanguageTable'].append(dict(
@@ -332,6 +364,18 @@ class Dataset(cldfbench.Dataset):
                     'described by the feature.',
             },
             {
+                "name": "Year",
+                "dc:description": "The time period to which the feature relates, specified as year "
+                                  "AD or with the keyword 'traditional', meaning either the time "
+                                  "of contact with European maritime powers or period when an "
+                                  "ancient language was spoken.",
+                "datatype": {
+                    "base": "string",
+                    "format": "[0-9]{3,4}|traditional"
+                },
+                "propertyUrl": "http://purl.org/dc/terms/temporal",
+            },
+            {
                 'name': 'Source',
                 'separator': ';',
                 'propertyUrl': 'http://cldf.clld.org/v1.0/terms.rdf#source'
@@ -354,10 +398,11 @@ class Dataset(cldfbench.Dataset):
         max_geojson_len = getattr(args, 'max_geojson_len', 10000)
         shp = shape(merged_geometry([f for _, f, _ in self.features]))
         f = json.dumps(Feature.from_geometry(shp))
-        tolerance = 0
-        while len(f) > max_geojson_len and tolerance < 0.6:
-            tolerance += 0.1
-            f = json.dumps(Feature.from_geometry(simplify(shp, tolerance)))
+        if len(f) < 10 * max_geojson_len:
+            tolerance = 0
+            while len(f) > max_geojson_len and tolerance < 0.8:
+                tolerance += 0.1
+                f = json.dumps(Feature.from_geometry(simplify(shp, tolerance)))
         if len(f) > max_geojson_len:
             # Fall back to just a rectangle built from the bounding box.
             minlon, minlat, maxlon, maxlat = self.bounds

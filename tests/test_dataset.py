@@ -2,8 +2,26 @@ import logging
 import argparse
 
 from cldfbench import CLDFWriter
+from shapely.geometry import shape, MultiPolygon, Point
 
-from pyglottography.dataset import Dataset
+from pyglottography.dataset import Dataset, valid_geometry
+
+
+def test_valid_geometry():
+    geo = {  # A self-intersecting polygon, with a line sticking out.
+        'type': 'Polygon',
+        'coordinates': [[
+            [-1, 1],
+            [1, 1],
+            [0, 0],
+            [-1, -1],
+            [1, -1],
+            [-2, 2],
+        ]]
+    }
+    res = shape(valid_geometry(geo))
+    assert isinstance(res, MultiPolygon)
+    assert res.contains(Point(0, 0.5)) and res.contains(Point(0, -0.5))
 
 
 def test_Dataset_download_error(fixtures_dir, caplog):
