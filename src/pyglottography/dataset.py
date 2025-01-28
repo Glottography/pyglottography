@@ -7,20 +7,26 @@ import subprocess
 import collections
 import dataclasses
 
-from shapely import simplify, make_valid
+from tqdm import tqdm
+from shapely import simplify, make_valid, difference
 from shapely.geometry import shape, Point, MultiPolygon, Polygon, GeometryCollection
 from pybtex.database import parse_file
 from clldutils.path import ensure_cmd
-from clldutils.jsonlib import update_ordered, load
+from clldutils.jsonlib import update_ordered, load, dump
 from clldutils.misc import slug
 from clldutils.markup import add_markdown_text
 import cldfbench
 from csvw.dsv import UnicodeWriter, reader
+from csvw.dsv_dialects import Dialect
 from cldfgeojson import MEDIA_TYPE, aggregate, feature_collection, merged_geometry
-from cldfgeojson.geojson import dump
 from pycldf.sources import Sources, Source
 
 OBSOLETE_PROPS = ['reference', 'map_image_file', 'url']
+
+
+def read_csv(p):
+    # We allow comments in CSV files.
+    return reader(p, dicts=True, dialect=Dialect())
 
 
 def get_one_source(p, bibkey=None):
@@ -107,6 +113,68 @@ class FeatureSpec:
         return res
 
 
+def recompute_shape(row, featuredict, feature_specs):
+    """
+    Recompute the geometry for a feature based in the specification in `row`.
+
+    :param row:
+    :param featuredict:
+    :param feature_specs:
+    :return:
+    """
+    tfid = row['source_fid']
+    f = featuredict.get(tfid, dict(properties=feature_specs[tfid].as_row(), type='Feature'))
+    if row['subtract']:
+        f['geometry'] = featuredict[row['source_fid']]['geometry']
+        for sfid in row['subtract'].split():
+            f['geometry'] = difference(
+                shape(f['geometry']), shape(featuredict[sfid]['geometry'])).__geo_interface__
+        if f['geometry']['type'] == 'MultiPolygon':  # pragma: no cover
+            # Remove artefacts created by not exactly matched shapes.
+            f['geometry']['coordinates'] = [
+                p for p in f['geometry']['coordinates']
+                if shape(dict(type='Polygon', coordinates=p)).area > 0.001]
+    elif row['replace']:
+        f['geometry'] = featuredict[row['replace']]['geometry']
+    if not f['geometry']['coordinates']:
+        raise ValueError()  # pragma: no cover
+    assert Feature(f).shape, f['properties']
+
+
+class Move:
+    """
+    Implements the moving (or copying) of a single Polygon from one feature to another.
+    """
+    def __init__(self, row):
+        self.source = row['source_fid']
+        self.target = row['target_fid'].split()
+        self.point = Point(float(row['longitude']), float(row['latitude']))
+        self.poly = None
+
+    def extracted(self, feature):
+        assert feature['properties']['id'] == self.source, 'expected {} gor {}'.format(
+            self.source, feature['properties']['id'])
+        if feature['geometry']['type'] == 'Polygon':
+            feature['geometry']['type'] = 'MultiPolygon'
+            feature['geometry']['coordinates'] = [feature['geometry']['coordinates']]
+        assert feature['geometry']['type'] == 'MultiPolygon', feature['geometry']['type']
+        for i, poly in enumerate(feature['geometry']['coordinates']):
+            if shape(dict(type='Polygon', coordinates=poly)).contains(self.point):
+                self.poly = poly
+                break
+        else:
+            return False  # pragma: no cover
+        del feature['geometry']['coordinates'][i]
+        return True
+
+    def append(self, feature):
+        assert self.poly
+        if feature['geometry']['type'] == 'Polygon':
+            feature['geometry']['type'] = 'MultiPolygon'
+            feature['geometry']['coordinates'] = [feature['geometry']['coordinates']]
+        feature['geometry']['coordinates'].append(self.poly)
+
+
 class Dataset(cldfbench.Dataset):
     """
     An augmented `cldfbench.Dataset`
@@ -137,15 +205,60 @@ class Dataset(cldfbench.Dataset):
                 writer.writerow(row.values())
 
     def iter_features(self):
-        for f in self.raw_dir.read_json('dataset.geojson')['features']:
+        """
+        Three error correction mechanisms are implemented:
+        - recomputing the geometries of features (from geometries of other features),
+        - moving polygons between features.
+        - replacing the geometry of a feature with a new one, as specified in a GeoJSON file.
+
+        :return:
+        """
+        fi = self.feature_inventory
+        # Check if we have to move polygons around:
+        moves, fixpolys = None, collections.defaultdict(list)
+        if self.etc_dir.joinpath('move_polygons.csv').exists():
+            # FIXME: allow for multiple moves per feature!
+            moves = [Move(r) for r in read_csv(self.etc_dir / 'move_polygons.csv')]
+            moves = {
+                fid: list(ms) for fid, ms in itertools.groupby(
+                    sorted(moves, key=lambda m: m.source), lambda m: m.source)}
+
+        features = self.raw_dir.read_json('dataset.geojson')['features']
+        remove = []
+        if self.etc_dir.joinpath('recompute_polygons.csv').exists():
+            features_by_id = {f['properties']['id']: f for f in features}
+            for row in read_csv(self.etc_dir / 'recompute_polygons.csv'):
+                try:
+                    recompute_shape(row, features_by_id, fi)
+                except ValueError:  # pragma: no cover
+                    remove.append(row['source_fid'])
+
+        features = [f for f in features if f['properties']['id'] not in remove]
+
+        if moves:  # First pass, extracting polygons to move.
+            for feature in features:
+                todo = moves.pop(feature['properties']['id'], None)
+                if todo:
+                    for move in todo:
+                        assert move.extracted(feature), (feature['properties'], move.point)
+                        for tfid in move.target:
+                            fixpolys[tfid].append(move)
+
+        for f in tqdm(features):
             fid = f['properties']['id']
-            spec = self.feature_inventory[fid]
+            if fid in fixpolys:
+                for poly in fixpolys[fid]:
+                    poly.append(f)
+                del fixpolys[fid]
+            spec = fi[fid]
             assert f['properties']['name'] == spec.name
             f['properties']['year'] = spec.year
             if spec.glottocode:
                 f['properties']['cldf:languageReference'] = spec.glottocode
             f['properties'].update(spec.properties)
             yield (fid, Feature(f), spec.glottocode)
+
+        assert not moves and not fixpolys, 'Not all specified moves executed'
 
     @functools.cached_property
     def features(self):
@@ -229,7 +342,10 @@ class Dataset(cldfbench.Dataset):
                 for prop in OBSOLETE_PROPS:
                     row.pop(prop, None)
                 rpoint = Point(float(row.pop('lon')), float(row.pop('lat')))
-                assert shp.contains(rpoint) or shp.convex_hull.contains(rpoint)
+                try:
+                    assert shp.contains(rpoint) or shp.convex_hull.contains(rpoint)
+                except AssertionError:  # pragma: no cover
+                    args.log.warning('{}: {}'.format(shp.convex_hull.distance(rpoint), row))
                 res.append(FeatureSpec.from_row(row))
 
             self.feature_inventory = res
@@ -244,9 +360,9 @@ class Dataset(cldfbench.Dataset):
         # 2. The shapes aggregated by language-level Glottocodes.
         # 3. The shapes aggregated by family-level Glottocodes.
         self.schema(args.writer.cldf)
-
         args.writer.cldf.add_sources(*Sources.from_file(self.etc_dir / "sources.bib"))
         features = []
+        fi = self.feature_inventory
         for pid, f, gc in self.features:
             features.append(f)
             args.writer.objects['ContributionTable'].append(dict(
@@ -256,7 +372,7 @@ class Dataset(cldfbench.Dataset):
                 Source=[self.id],
                 Media_ID='features',
                 Map_Name=f.properties['map_name_full'],
-                Year=self.feature_inventory[pid].year,
+                Year=fi[pid].year,
             ))
         dump(
             feature_collection(
