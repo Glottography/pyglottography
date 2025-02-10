@@ -39,8 +39,16 @@ def test_Dataset_download(tmprepos, mocker, glottolog):
         id = 'author2022word'
         dir = tmprepos
 
+        def cmd_download(self, args):
+            Dataset.cmd_download(self, args)
+            fspec = self.etc_dir / 'features.csv'
+            fspec_content = fspec.read_text(encoding='utf-8')
+            fspec_content += '\n25x,name,,,,,,'
+            fspec.write_text(fspec_content)
+
     ds = D()
     ds.cmd_download(argparse.Namespace(log=logging.getLogger(__name__)))
+    ds.etc_dir.joinpath('features.csv').unlink()
     # cmd_download is supposed to be idempotent.
     ds.cmd_download(argparse.Namespace(log=logging.getLogger(__name__)))
     with CLDFWriter(cldf_spec=ds.cldf_specs(), dataset=ds) as writer:

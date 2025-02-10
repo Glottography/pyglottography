@@ -8,7 +8,7 @@ import collections
 import dataclasses
 
 from tqdm import tqdm
-from shapely import simplify, make_valid, difference
+from shapely import make_valid, difference, simplify
 from shapely.geometry import shape, Point, MultiPolygon, Polygon, GeometryCollection
 from pybtex.database import parse_file
 from clldutils.path import ensure_cmd
@@ -19,6 +19,7 @@ import cldfbench
 from csvw.dsv import UnicodeWriter, reader
 from csvw.dsv_dialects import Dialect
 from cldfgeojson import MEDIA_TYPE, aggregate, feature_collection, merged_geometry
+from cldfgeojson.create import shapely_simplified_geometry
 from pycldf.sources import Sources, Source
 
 OBSOLETE_PROPS = ['reference', 'map_image_file', 'url']
@@ -180,6 +181,7 @@ class Dataset(cldfbench.Dataset):
     An augmented `cldfbench.Dataset`
     """
     _sdir = None
+    _buffer = 0.005
 
     @functools.cached_property
     def feature_inventory_path(self):
@@ -223,7 +225,14 @@ class Dataset(cldfbench.Dataset):
                 fid: list(ms) for fid, ms in itertools.groupby(
                     sorted(moves, key=lambda m: m.source), lambda m: m.source)}
 
-        features = self.raw_dir.read_json('dataset.geojson')['features']
+        features = []
+        for f in self.raw_dir.read_json('dataset.geojson')['features']:
+            repl = self.etc_dir / '{}.geojson'.format(f['properties']['id'])
+            if repl.exists():
+                features.extend(load(repl)['features'])
+            else:
+                features.append(f)
+
         remove = []
         if self.etc_dir.joinpath('recompute_polygons.csv').exists():
             features_by_id = {f['properties']['id']: f for f in features}
@@ -251,14 +260,24 @@ class Dataset(cldfbench.Dataset):
                     poly.append(f)
                 del fixpolys[fid]
             spec = fi[fid]
-            assert f['properties']['name'] == spec.name
+            assert f['properties']['name'] == spec.name or spec.properties.get('note'), (
+                '{} vs. {}'.format(spec.name, f['properties']['name']))
             f['properties']['year'] = spec.year
             if spec.glottocode:
                 f['properties']['cldf:languageReference'] = spec.glottocode
             f['properties'].update(spec.properties)
             yield (fid, Feature(f), spec.glottocode)
 
-        assert not moves and not fixpolys, 'Not all specified moves executed'
+        for fid, items in fixpolys.items():
+            spec = fi[fid]
+            yield (fid,
+                   Feature(dict(
+                       type='Feature',
+                       properties=spec.as_row(),
+                       geometry=dict(type='MultiPolygon', coordinates=[m.poly for m in items]))),
+                   spec.glottocode)
+
+        assert not moves, 'Not all specified moves executed'
 
     @functools.cached_property
     def features(self):
@@ -397,8 +416,14 @@ class Dataset(cldfbench.Dataset):
                 [(pid, f, gc) for pid, f, gc in self.features if gc],
                 args.glottolog.api,
                 level=ptype,
-                buffer=0.005,
+                buffer=self._buffer,
                 opacity=0.5)
+            if ptype == 'family':
+                # For the shapes aggregated on family level, we make sure the GoeJSON doesn't get
+                # too big. If it would get close to 1MB, we simplify the geometry.
+                for f in features:
+                    if len(json.dumps(f)) > 1000000:  # pragma: no cover
+                        shapely_simplified_geometry(f)
             dump(
                 feature_collection(
                     features,
