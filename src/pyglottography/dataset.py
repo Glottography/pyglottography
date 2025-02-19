@@ -19,7 +19,7 @@ import cldfbench
 from csvw.dsv import UnicodeWriter, reader
 from csvw.dsv_dialects import Dialect
 from cldfgeojson import MEDIA_TYPE, aggregate, feature_collection, merged_geometry
-from cldfgeojson.create import shapely_simplified_geometry
+from cldfgeojson.create import shapely_simplified_geometry, shapely_fixed_geometry
 from pycldf.sources import Sources, Source
 
 OBSOLETE_PROPS = ['reference', 'map_image_file', 'url']
@@ -174,6 +174,9 @@ class Move:
             feature['geometry']['type'] = 'MultiPolygon'
             feature['geometry']['coordinates'] = [feature['geometry']['coordinates']]
         feature['geometry']['coordinates'].append(self.poly)
+        shp = shape(feature['geometry'])
+        if not shp.is_valid:  # pragma: no cover
+            shapely_fixed_geometry(feature)
 
 
 class Dataset(cldfbench.Dataset):
