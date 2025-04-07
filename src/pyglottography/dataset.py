@@ -135,6 +135,11 @@ def recompute_shape(row, featuredict, feature_specs):
             f['geometry']['coordinates'] = [
                 p for p in f['geometry']['coordinates']
                 if shape(dict(type='Polygon', coordinates=p)).area > 0.001]
+            if row.get('num_polys'):
+                f['geometry']['coordinates'] = sorted(
+                    f['geometry']['coordinates'],
+                    key=lambda p: shape(dict(type='Polygon', coordinates=p)).area,
+                    reverse=True)[:int(row['num_polys'])]
     elif row['replace']:
         f['geometry'] = featuredict[row['replace']]['geometry']
     if not f['geometry']['coordinates']:
