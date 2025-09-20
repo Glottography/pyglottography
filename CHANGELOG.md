@@ -1,6 +1,16 @@
 # Changes
 
 
+## unreleased
+
+- Fixed bug whereby invalid geometries might have been created for families due to
+  issues introduced by simplification.
+- Changed the data model of Glottography CLDF datasets in backwards incompatible
+  ways.
+- Added command to create an HTML page displaying one map of a dataset, mostly for
+  quality control.
+
+
 ## [1.0.0] - 2025-04-07
 
 Fine-tuned repair mechanisms.

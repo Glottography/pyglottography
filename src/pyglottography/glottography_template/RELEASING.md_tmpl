@@ -1,26 +1,31 @@
 # Releasing the dataset
 
-In case of upstream changes in glottography-data:
+## Recreate the data extracted from the source
+
 ```shell
 cldfbench download cldfbench_{id}.py
 ```
 
+## Recreate the CLDF dataset
+
 ```shell
-cldfbench makecldf cldfbench_{id}.py --glottolog-version v5.1
+cldfbench makecldf cldfbench_{id}.py --glottolog-version v5.2
+cldfbench cldfreadme cldfbench_{id}.py
+cldfbench zenodo --communities glottography cldfbench_{id}.py
+cldfbench readme cldfbench_{id}.py
 ```
+
+
+## Validation
 
 ```shell
 cldf validate cldf
 ```
 
 ```shell
-cldfbench cldfreadme cldfbench_{id}.py
+cldfbench geojson.validate cldf
 ```
 
 ```shell
-cldfbench zenodo cldfbench_{id}.py
-```
-
-```shell
-cldfbench readme cldfbench_{id}.py
+cldfbench geojson.glottolog_distance cldf --format tsv | csvformat -t | csvgrep -c Distance -r"^0\.?" -i | csvsort -c Distance | csvcut -c ID,Distance | csvformat -E | termgraph
 ```

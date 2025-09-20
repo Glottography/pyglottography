@@ -1,5 +1,6 @@
 import json
 import math
+import shutil
 import typing
 import functools
 import itertools
@@ -10,7 +11,7 @@ import dataclasses
 from tqdm import tqdm
 from shapely import make_valid, difference, simplify
 from shapely.geometry import shape, Point, MultiPolygon, Polygon, GeometryCollection
-from pybtex.database import parse_file
+from simplepybtex.database import parse_file
 from clldutils.path import ensure_cmd
 from clldutils.jsonlib import update_ordered, load, dump
 from clldutils.misc import slug
@@ -22,6 +23,8 @@ from cldfgeojson import MEDIA_TYPE, aggregate, feature_collection, merged_geomet
 from cldfgeojson.create import shapely_simplified_geometry, shapely_fixed_geometry
 from pycldf.sources import Sources, Source
 
+from .util import Feature, bbox
+
 OBSOLETE_PROPS = ['reference', 'map_image_file', 'url']
 
 
@@ -30,16 +33,15 @@ def read_csv(p):
     return reader(p, dicts=True, dialect=Dialect())
 
 
-def get_one_source(p, bibkey=None):
+def get_one_source(p, bibkey=None) -> typing.Optional[typing.Tuple[Source, str]]:
     """
-    Read the only entry from a BibTeX file.
+    Read the first entry from a BibTeX file.
 
-    :param p:
-    :return:
+    :param p: Path of a BibTeX file.
+    :param bibkey: If supplied, `bibkey` will be used as identifier of the returned `Source` object.
+    :return: A `Source` object representing the first entry in the file and the original bibkey.
     """
-    bib = parse_file(str(p), 'bibtex')
-    # assert len(bib.entries) == 1
-    for key, entry in bib.entries.items():
+    for key, entry in parse_file(str(p), 'bibtex').entries.items():
         return Source.from_entry(bibkey or key, entry), key
 
 
@@ -59,26 +61,6 @@ def valid_geometry(geometry):
         assert isinstance(res, (Polygon, MultiPolygon)) and res.is_valid
         geometry = res.__geo_interface__
     return geometry
-
-
-class Feature(dict):
-    """
-    A (readonly) GeoJSON feature dict with syntactic sugar to access shape and properties.
-    """
-    @functools.cached_property
-    def shape(self):
-        return shape(self['geometry'])
-
-    @functools.cached_property
-    def properties(self):
-        return self['properties']
-
-    @classmethod
-    def from_geometry(cls, geometry, properties=None):
-        return cls(dict(
-            type='Feature',
-            geometry=getattr(geometry, '__geo_interface__', geometry),
-            properties=properties or {}))
 
 
 @dataclasses.dataclass
@@ -116,7 +98,7 @@ class FeatureSpec:
 
 def recompute_shape(row, featuredict, feature_specs):
     """
-    Recompute the geometry for a feature based in the specification in `row`.
+    Recompute the geometry for a feature based on the specification in `row`.
 
     :param row:
     :param featuredict:
@@ -188,6 +170,8 @@ class Dataset(cldfbench.Dataset):
     """
     An augmented `cldfbench.Dataset`
     """
+    # Derived datasets can override the default directory in glottography-data from which to
+    # download the raw data.
     _sdir = None
     _buffer = 0.005
 
@@ -207,12 +191,7 @@ class Dataset(cldfbench.Dataset):
     @feature_inventory.setter
     def feature_inventory(self, value):
         with UnicodeWriter(self.feature_inventory_path) as writer:
-            for i, row in enumerate(value):
-                assert isinstance(row, FeatureSpec)
-                row = row.as_row()
-                if i == 0:
-                    writer.writerow(row.keys())
-                writer.writerow(row.values())
+            writer.writerows([row.as_row() for row in value])
 
     def iter_features(self):
         """
@@ -262,7 +241,7 @@ class Dataset(cldfbench.Dataset):
                             fixpolys[tfid].append(move)
 
         for f in tqdm(features):
-            fid = f['properties']['id']
+            fid = str(f['properties']['id'])
             if fid in fixpolys:
                 for poly in fixpolys[fid]:
                     poly.append(f)
@@ -293,11 +272,7 @@ class Dataset(cldfbench.Dataset):
 
     @functools.cached_property
     def bounds(self):
-        polys = list(itertools.chain(*[
-            f.shape.geoms if isinstance(f.shape, MultiPolygon) else [f.shape]
-            for _, f, _ in self.features]))
-        # minx, miny, maxx, maxy
-        res = MultiPolygon(polys).bounds
+        res = bbox([f for _, f, _ in self.features])
         return (
             math.floor(res[0] * 10) / 10,
             math.floor(res[1] * 10) / 10,
@@ -305,7 +280,18 @@ class Dataset(cldfbench.Dataset):
             math.ceil(res[3] * 10) / 10,
         )
 
+    def bounding_box_as_feature(self):
+        minlon, minlat, maxlon, maxlat = self.bounds
+        coords = [[
+            (minlon, minlat), (minlon, maxlat), (maxlon, maxlat), (maxlon, minlat), (minlon, minlat)
+        ]]
+        return Feature.from_geometry(dict(type='Polygon', coordinates=coords))
+
     def cmd_download(self, args):
+        """
+        Implements the creation of `raw/dataset.geojson` and `etc/features.csv` for the default case
+        where a corresponding directory of the glottography-data repository exists.
+        """
         # turn geopackage into geojson
         # turn polygon list into etc/polygons.csv
         # make sure list is complete and polygons are valid.
@@ -387,20 +373,32 @@ class Dataset(cldfbench.Dataset):
         # 2. The shapes aggregated by language-level Glottocodes.
         # 3. The shapes aggregated by family-level Glottocodes.
         self.schema(args.writer.cldf)
+        self.local_schema(args.writer.cldf)
         args.writer.cldf.add_sources(*Sources.from_file(self.etc_dir / "sources.bib"))
         features = []
         fi = self.feature_inventory
+        maps, with_maps = {}, False
+        if self.etc_dir.joinpath('maps.csv').exists():
+            with_maps = True
+            for r in self.etc_dir.read_csv('maps.csv', dicts=True):
+                args.writer.objects['ContributionTable'].append(
+                    self.make_contribution_map(args, maps, r))
+
         for pid, f, gc in self.features:
-            features.append(f)
-            args.writer.objects['ContributionTable'].append(dict(
-                ID=pid,
-                Name=f.properties['name'],
-                Glottocode=gc or None,
-                Source=[self.id],
-                Media_ID='features',
-                Map_Name=f.properties['map_name_full'],
-                Year=fi[pid].year,
-            ))
+            if not with_maps:
+                if fi[pid].properties['map_name_full'] not in maps:
+                    args.writer.objects['ContributionTable'].append(self.make_contribution_map(
+                        args,
+                        maps,
+                        {},
+                        id='map_{}'.format(len(maps) + 1),
+                        name=fi[pid].properties['map_name_full']))
+            f = self.make_feature(args, f)
+            features.append(shapely_fixed_geometry(f))
+            args.writer.objects['ContributionTable'].append(
+                self.make_contribution_feature(
+                    args, pid, gc, f, fi[pid], maps[fi[pid].properties['map_name_full']]['ID']
+                ))
         dump(
             feature_collection(
                 features,
@@ -431,7 +429,7 @@ class Dataset(cldfbench.Dataset):
                 # too big. If it would get close to 1MB, we simplify the geometry.
                 for f in features:
                     if len(json.dumps(f)) > 1000000:  # pragma: no cover
-                        shapely_simplified_geometry(f)
+                        shapely_fixed_geometry(shapely_simplified_geometry(f))
             dump(
                 feature_collection(
                     features,
@@ -465,6 +463,81 @@ class Dataset(cldfbench.Dataset):
         args.writer.cldf.properties['dc:spatial'] = \
             ('westlimit={:.1f}; southlimit={:.1f}; eastlimit={:.1f}; northlimit={:.1f}'.format(
                 *self.bounds))
+
+    def make_feature(self, args, f: Feature) -> Feature:
+        """
+        Derived datasets can override this method to customize the GeoJSON feature objects form
+        the source data.
+        """
+        return f
+
+    def make_contribution_map(self, args, maps, md, **kw):
+        md.update(kw)
+        res = dict(
+            ID=md['id'],
+            Name=md['name'],
+            Glottocode=None,
+            Source=[self.id],
+            Media_IDs=md.get('Media_IDs', []),
+            Type='map',
+            Description=md.get('description'),
+            Year=None,
+        )
+        maps[res['Name']] = res
+        return res
+
+    def iter_map_files(self, cldfdir, map_, geotiff, web, bounds):
+        """
+        Copy the files and return a triple of `dict`s suitable as rows in MediaTable.
+        """
+        d = cldfdir / 'maps' / map_['ID']
+        if not d.exists():
+            d.mkdir(parents=True)
+        for p, name, mimetype, description in [
+            (geotiff, 'map.tif', 'image/tiff',
+             'Georeferenced GeoTIFF image of the map for crs EPSG:4326'),
+            (web, 'web.jpg', 'image/jpeg',
+             'JPG translation of the georeferenced image reprojected to webmercator'),
+            (bounds, 'web.jpg.bounds.geojson', 'application/geo+json',
+             'The bounds of the JPG image of the map'),
+        ]:
+            target = d / name
+            shutil.copy(p, target)
+            yield dict(
+                ID='{}_{}'.format(map_['ID'], name.split('.')[-1]),
+                Name=name,
+                Description=description,
+                Download_URL=str(target.relative_to(cldfdir)),
+                Media_Type=mimetype,
+            )
+
+    def make_contribution_feature(self,
+                                  args,
+                                  pid: str,
+                                  gc: typing.Optional[str],
+                                  f: Feature,
+                                  fmd: FeatureSpec,
+                                  map_id: str) -> dict:
+        """
+        Derived datasets can override this method to customize the item in ContributionTable to be
+        written for each source feature.
+        """
+        return dict(
+            ID=pid,
+            Name=f.properties['name'],
+            Glottocode=gc or None,
+            Source=[self.id],
+            Media_IDs=['features'],
+            Type='feature',
+            Map_IDs=[map_id],
+            Year=fmd.year,
+        )
+
+    def local_schema(self, cldf):
+        """
+        Derived datasets can override this method to customize the CLDF schema for the dataset.
+        """
+        pass
 
     def schema(self, cldf):
         cldf.add_component('MediaTable')
@@ -530,13 +603,29 @@ class Dataset(cldfbench.Dataset):
                 'propertyUrl': 'http://cldf.clld.org/v1.0/terms.rdf#source'
             },
             {
-                'name': 'Media_ID',
+                'name': 'Media_IDs',
                 'propertyUrl': 'http://cldf.clld.org/v1.0/terms.rdf#mediaReference',
-                'dc:description': 'Features are linked to GeoJSON files that store the geo data.'
+                "dc:description": "Contributions of type 'feature' are linked to GeoJSON files "
+                                  "that store the geo data.  can be related to various kinds of "
+                                  "media. Contributions of type 'map' are linked to the "
+                                  "corresponding scans of maps and geo-data derived from these.",
+                "separator": " ",
             },
             {
-                'name': 'Map_Name',
-                'dc:description': 'Name of the map as given in the source publication.'
+                "dc:description": "There are two types of contributions: Individual geo-features "
+                                  "as depicted in the source and images of maps.",
+                "datatype": {
+                    "base": "string",
+                    "format": "map|feature"
+                },
+                "name": "Type"
+            },
+            {
+                'name': 'Map_IDs',
+                "separator": " ",
+                'propertyUrl': 'http://cldf.clld.org/v1.0/terms.rdf#contributionReference',
+                "dc:description": "Contributions of type 'feature' link to the maps on which "
+                                  "they appear.",
             }
         )
         t.common_props['dc:description'] = \
@@ -544,26 +633,21 @@ class Dataset(cldfbench.Dataset):
              'preserve the original metadata and a point of reference for the aggregated shapes.')
 
     def cmd_readme(self, args):
-        max_geojson_len = getattr(args, 'max_geojson_len', 10000)
-        shp = shape(merged_geometry([f for _, f, _ in self.features]))
-        f = json.dumps(Feature.from_geometry(shp))
-        if len(f) < 10 * max_geojson_len:
-            tolerance = 0
-            while len(f) > max_geojson_len and tolerance < 0.8:
-                tolerance += 0.1
-                f = json.dumps(Feature.from_geometry(simplify(shp, tolerance)))
-        if len(f) > max_geojson_len:
-            # Fall back to just a rectangle built from the bounding box.
-            minlon, minlat, maxlon, maxlat = self.bounds
-            coords = [[
-                (minlon, minlat),
-                (minlon, maxlat),
-                (maxlon, maxlat),
-                (maxlon, minlat),
-                (minlon, minlat)
-            ]]
-            f = json.dumps(Feature.from_geometry(dict(type='Polygon', coordinates=coords)))
-        return add_markdown_text(
+        if len(self.features) > 500:
+            f = json.dumps(self.bounding_box_as_feature())
+        else:
+            max_geojson_len = getattr(args, 'max_geojson_len', 10000)
+            shp = shape(merged_geometry([f for _, f, _ in self.features]))
+            f = json.dumps(Feature.from_geometry(shp))
+            if len(f) < 10 * max_geojson_len:
+                tolerance = 0
+                while len(f) > max_geojson_len and tolerance < 0.8:
+                    tolerance += 0.1
+                    f = json.dumps(Feature.from_geometry(simplify(shp, tolerance)))
+            if len(f) > max_geojson_len:
+                # Fall back to just a rectangle built from the bounding box.
+                f = json.dumps(self.bounding_box_as_feature())
+        res = add_markdown_text(
             cldfbench.Dataset.cmd_readme(self, args),
             """
 
@@ -574,3 +658,8 @@ class Dataset(cldfbench.Dataset):
 ```
 """.format(f),
             'Description')
+        if self.dir.joinpath('NOTES.md').exists():
+            lines = self.dir.joinpath('NOTES.md').read_text(encoding='utf8').split('\n')
+            text = '\n'.join('##' + line if line.startswith('#') else line for line in lines)
+            res = add_markdown_text(res, text, "Coverage")
+        return res
