@@ -1,10 +1,27 @@
 import logging
 import argparse
 
+import pytest
 from cldfbench import CLDFWriter
 from shapely.geometry import shape, MultiPolygon, Point
 
 from pyglottography.dataset import Dataset, valid_geometry
+
+
+@pytest.fixture
+def dataset(tmprepos):
+    class D(Dataset):
+        id = 'author2022word'
+        dir = tmprepos
+
+        def cmd_download(self, args):
+            Dataset.cmd_download(self, args)
+            fspec = self.etc_dir / 'features.csv'
+            fspec_content = fspec.read_text(encoding='utf-8')
+            fspec_content += '\n25x,name,,,Figure 1,,,'
+            fspec.write_text(fspec_content)
+
+    return D()
 
 
 def test_valid_geometry():
@@ -34,30 +51,35 @@ def test_Dataset_download_error(fixtures_dir, caplog):
     assert caplog.records[-1].levelname == 'ERROR'
 
 
-def test_Dataset_download(tmprepos, mocker, glottolog):
-    class D(Dataset):
-        id = 'author2022word'
-        dir = tmprepos
-
-        def cmd_download(self, args):
-            Dataset.cmd_download(self, args)
-            fspec = self.etc_dir / 'features.csv'
-            fspec_content = fspec.read_text(encoding='utf-8')
-            fspec_content += '\n25x,name,,,,,,'
-            fspec.write_text(fspec_content)
-
-    ds = D()
-    ds.cmd_download(argparse.Namespace(log=logging.getLogger(__name__)))
-    ds.etc_dir.joinpath('features.csv').unlink()
+def test_Dataset_download(mocker, glottolog, dataset):
+    dataset.cmd_download(argparse.Namespace(log=logging.getLogger(__name__)))
+    dataset.etc_dir.joinpath('features.csv').unlink()
     # cmd_download is supposed to be idempotent.
-    ds.cmd_download(argparse.Namespace(log=logging.getLogger(__name__)))
-    with CLDFWriter(cldf_spec=ds.cldf_specs(), dataset=ds) as writer:
-        ds.cmd_makecldf(argparse.Namespace(
+    dataset.cmd_download(argparse.Namespace(log=logging.getLogger(__name__)))
+    with CLDFWriter(cldf_spec=dataset.cldf_specs(), dataset=dataset) as writer:
+        dataset.cmd_makecldf(argparse.Namespace(
             glottolog=mocker.Mock(api=glottolog),
             writer=writer,
             log=logging.getLogger(__name__),
         ))
-    ds.cmd_readme(argparse.Namespace(
+    readme = dataset.cmd_readme(argparse.Namespace(
         log=logging.getLogger(__name__), max_geojson_len=5))
-    res = ds.cmd_readme(argparse.Namespace(log=logging.getLogger(__name__)))
+    assert 'includeme' in readme
+    res = dataset.cmd_readme(argparse.Namespace(log=logging.getLogger(__name__)))
     assert 'geojson' in res
+
+
+def test_Dataset_makecldf(dataset, mocker, glottolog):
+    import shutil
+
+    dataset.cmd_download(argparse.Namespace(log=logging.getLogger(__name__)))
+    dataset.etc_dir.joinpath('maps.csv').write_text('id,name\nfig,Figure 1')
+
+    with CLDFWriter(cldf_spec=dataset.cldf_specs(), dataset=dataset) as writer:
+        assert len(list(dataset.iter_map_files(
+            dataset.cldf_dir, dict(ID='m'), *(3 * [dataset.raw_dir / 'dataset.geojson'])))) == 3
+        dataset.cmd_makecldf(argparse.Namespace(
+            glottolog=mocker.Mock(api=glottolog),
+            writer=writer,
+            log=logging.getLogger(__name__),
+        ))

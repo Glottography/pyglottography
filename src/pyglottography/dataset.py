@@ -633,7 +633,7 @@ class Dataset(cldfbench.Dataset):
              'preserve the original metadata and a point of reference for the aggregated shapes.')
 
     def cmd_readme(self, args):
-        if len(self.features) > 500:
+        if len(self.features) > 500:  # pragma: no cover
             f = json.dumps(self.bounding_box_as_feature())
         else:
             max_geojson_len = getattr(args, 'max_geojson_len', 10000)

@@ -3,11 +3,13 @@ Display a georeferenced map.
 """
 import json
 import pathlib
+import argparse
 import webbrowser
 
 from pycldf.media import File
 from pycldf.cli_util import add_dataset, get_dataset
 from clldutils.misc import data_url
+from clldutils.clilib import PathType
 from mako.lookup import Template
 
 from pyglottography.util import bbox
@@ -16,6 +18,11 @@ from pyglottography.util import bbox
 def register(parser):
     add_dataset(parser)
     parser.add_argument('map-id')
+    parser.add_argument(
+        '-o', '--output',
+        type=PathType(type='file', must_exist=False),
+        default=pathlib.Path('.') / 'index.html')
+    parser.add_argument('--test', action='store_true', default=False, help=argparse.SUPPRESS)
 
 
 def run(args):
@@ -23,10 +30,8 @@ def run(args):
     Assemble geo-referenced scan and associated polygons.
     Format as standalone HTML page using leaflet.
     """
-    out = pathlib.Path('.')
-
-    def render(fname, **vars):
-        out.joinpath(fname).write_text(
+    def render(**vars):
+        args.output.write_text(
             Template(filename=str(pathlib.Path(__file__).parent / 'map.html.mako')).render(**vars),
             encoding='utf8')
 
@@ -59,7 +64,6 @@ def run(args):
     else:
         bounds = bounds.read_json()['bbox']
     render(
-        'index.html',
         map=m,
         img=data_url(img.read(), 'image/jpeg') if img else None,
         geojson=json.dumps(dict(type='FeatureCollection', features=gfeatures)),
@@ -71,4 +75,5 @@ def run(args):
         w=4,
     )
 
-    webbrowser.open(str(out / 'index.html'))
+    if not args.test:
+        webbrowser.open(str(args.output))  # pragma: no cover
