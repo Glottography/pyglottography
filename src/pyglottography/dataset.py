@@ -397,7 +397,13 @@ class Dataset(cldfbench.Dataset):
             features.append(shapely_fixed_geometry(f))
             args.writer.objects['ContributionTable'].append(
                 self.make_contribution_feature(
-                    args, pid, gc, f, fi[pid], maps[fi[pid].properties['map_name_full']]['ID']
+                    args,
+                    pid,
+                    gc,
+                    f,
+                    fi[pid],
+                    [maps[mname.strip()]['ID']
+                     for mname in fi[pid].properties['map_name_full'].split('|')]
                 ))
         dump(
             feature_collection(
@@ -415,8 +421,9 @@ class Dataset(cldfbench.Dataset):
         ))
 
         lids = None
-        for ptype in ['language', 'family']:
-            label = 'languages' if ptype == 'language' else 'families'
+        for ptype in ['dialect', 'language', 'family']:
+            label = 'languages' if ptype == 'language' else \
+                ('dialects' if ptype == 'dialect' else 'families')
             p = self.cldf_dir / '{}.geojson'.format(label)
             features, languages = aggregate(
                 [(pid, f, gc) for pid, f, gc in self.features if gc],
@@ -463,6 +470,7 @@ class Dataset(cldfbench.Dataset):
         args.writer.cldf.properties['dc:spatial'] = \
             ('westlimit={:.1f}; southlimit={:.1f}; eastlimit={:.1f}; northlimit={:.1f}'.format(
                 *self.bounds))
+        assert args.writer.cldf.sources
 
     def make_feature(self, args, f: Feature) -> Feature:
         """
@@ -517,7 +525,7 @@ class Dataset(cldfbench.Dataset):
                                   gc: typing.Optional[str],
                                   f: Feature,
                                   fmd: FeatureSpec,
-                                  map_id: str) -> dict:
+                                  map_ids: typing.List[str]) -> dict:
         """
         Derived datasets can override this method to customize the item in ContributionTable to be
         written for each source feature.
@@ -529,7 +537,7 @@ class Dataset(cldfbench.Dataset):
             Source=[self.id],
             Media_IDs=['features'],
             Type='feature',
-            Map_IDs=[map_id],
+            Map_IDs=map_ids,
             Year=fmd.year,
         )
 

@@ -57,7 +57,7 @@
 <body>
 <div class="pure-g">
     <div class="pure-u-5-5" style="padding-left: 1em; padding-right: 1em;">
-        <p><strong>${map.cldf.name}</strong> ${map.cldf.description}</p>
+        <p><strong>${map.cldf.name or 'Map'}</strong> ${map.cldf.description or map.id}</p>
         <p>in</p>
         % for ref in map.references:
         <blockquote>
@@ -65,7 +65,7 @@
         </blockquote>
         % endfor
         <p>
-            The map shows the geographic features from the figure as digitized in the Glottography
+            The map shows the geographic features from the map as digitized in the Glottography
             dataset.</p>
         <p>The table lists Glottolog languoids associated with these features.</p>
     </div>

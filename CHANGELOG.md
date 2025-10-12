@@ -9,6 +9,7 @@
   ways.
 - Added command to create an HTML page displaying one map of a dataset, mostly for
   quality control.
+- `makecldf` will now add shapes available for dialects as speaker areas as well.
 
 
 ## [1.0.0] - 2025-04-07
