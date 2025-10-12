@@ -1,7 +1,7 @@
 # Changes
 
 
-## unreleased
+## [1.1.0] - 2025-10-12
 
 - Fixed bug whereby invalid geometries might have been created for families due to
   issues introduced by simplification.
