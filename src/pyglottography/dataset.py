@@ -9,8 +9,10 @@ import collections
 import dataclasses
 
 from tqdm import tqdm
-from shapely import make_valid, difference, simplify
-from shapely.geometry import shape, Point, MultiPolygon, Polygon, GeometryCollection
+import spherely
+from shapely import make_valid, difference, simplify, remove_repeated_points
+from shapely.geometry import shape, Point, MultiPolygon, Polygon, GeometryCollection, mapping
+from shapely.ops import unary_union
 from simplepybtex.database import parse_file
 from clldutils.path import ensure_cmd
 from clldutils.jsonlib import update_ordered, load, dump
@@ -22,6 +24,7 @@ from csvw.dsv_dialects import Dialect
 from cldfgeojson import MEDIA_TYPE, aggregate, feature_collection, merged_geometry
 from cldfgeojson.create import shapely_simplified_geometry, shapely_fixed_geometry
 from pycldf.sources import Sources, Source
+import numpy as np
 
 from .util import Feature, bbox
 
@@ -61,6 +64,272 @@ def valid_geometry(geometry):
         assert isinstance(res, (Polygon, MultiPolygon)) and res.is_valid
         geometry = res.__geo_interface__
     return geometry
+
+
+def merge_features_by_glottocode(features, check_only=False):
+    """Merge features sharing the same glottocode."""
+    by_gc = collections.defaultdict(list)
+    no_gc = []
+    for f in features:
+        gc = f.get('properties', {}).get('cldf:languageReference')
+        if gc:
+            by_gc[gc].append(f)
+        else:
+            no_gc.append(f)
+
+    # Check for duplicates
+    duplicates = {gc: len(group) for gc, group in by_gc.items() if len(group) > 1}
+
+    if check_only:
+        if duplicates:
+            print(f"Found {len(duplicates)} glottocodes with multiple features: {duplicates}")
+            return True
+        else:
+            print("No duplicate glottocodes")
+            return False
+
+    # Merge each group
+    merged = []
+    for gc, group in by_gc.items():
+        if len(group) == 1:
+            merged.append(group[0])
+        else:
+            geoms = [shape(f['geometry']) for f in group]
+            merged_geom = unary_union(geoms)
+            new_feature = dict(group[0])
+            new_feature['geometry'] = mapping(merged_geom)
+
+            # Merge properties that may differ across features
+            new_feature['properties'] = dict(new_feature['properties'])
+            new_feature['properties']['name'] = merge_property_values(group, 'name')
+            new_feature['properties']['year'] = merge_property_values(group, 'year')
+
+            # Check if any feature has number_legend - if so, merge map and legend as pairs
+            has_legend = any(f['properties'].get('number_legend') for f in group)
+            if has_legend:
+                merged_maps, merged_legends = merge_map_and_legend(group)
+                new_feature['properties']['map_name_full'] = merged_maps
+                new_feature['properties']['number_legend'] = merged_legends
+
+                # Reconstruct 'maps' from the merged map_name_full and number_legend
+                map_list = [m.strip() for m in merged_maps.split('|') if m.strip()]
+                legend_list = [lg.strip() for lg in merged_legends.split('|') if lg.strip()]
+                while len(legend_list) < len(map_list):
+                    legend_list.append('')
+                new_feature['properties']['maps'] = [
+                    '{} [{}]'.format(m, lg) for m, lg in zip(map_list, legend_list)]
+            else:
+                new_feature['properties']['map_name_full'] = merge_property_values(group, 'map_name_full')
+
+            shapely_fixed_geometry(new_feature)
+            merged.append(new_feature)
+
+    # Re-enumerate IDs after merging
+    result = merged + no_gc
+    for i, f in enumerate(result, start=1):
+        f['properties']['id'] = str(i)
+
+    return result
+
+
+def merge_property_values(group, prop_name):
+    """Merge property values from multiple features, concatenating unique values with ' | '."""
+    values = [f['properties'].get(prop_name, '') for f in group]
+
+    # Check if all values are the same
+    if len(set(values)) == 1:
+        return values[0]
+
+    # Split all values by "|", collect unique entries
+    all_entries = []
+    for v in values:
+        entries = [e.strip() for e in str(v).split('|')]
+        all_entries.extend(entries)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique = []
+    for entry in all_entries:
+        if entry and entry not in seen:
+            seen.add(entry)
+            unique.append(entry)
+
+    return ' | '.join(unique)
+
+
+def merge_map_and_legend(group):
+    """
+    Merge map_name_full and number_legend as paired values.
+
+    Each entry in map_name_full corresponds positionally to an entry in number_legend.
+    When merging, we keep these pairs together and deduplicate based on the pair.
+    """
+    # Collect all (map, legend) pairs from all features
+    all_pairs = []
+    for f in group:
+        maps = [m.strip() for m in str(f['properties'].get('map_name_full', '')).split('|')]
+        legends = [lg.strip() for lg in str(f['properties'].get('number_legend', '')).split('|')]
+
+        # Pad legends if shorter than maps
+        while len(legends) < len(maps):
+            legends.append('')
+
+        for m, lg in zip(maps, legends):
+            if m:  # Only add if map name is not empty
+                all_pairs.append((m, lg))
+
+    # Remove duplicate pairs while preserving order
+    seen = set()
+    unique_pairs = []
+    for pair in all_pairs:
+        if pair not in seen:
+            seen.add(pair)
+            unique_pairs.append(pair)
+
+    if not unique_pairs:
+        return '', ''
+
+    merged_maps = ' | '.join(p[0] for p in unique_pairs)
+    merged_legends = ' | '.join(p[1] for p in unique_pairs)
+
+    return merged_maps, merged_legends
+
+
+def azimuth(p1, p2):
+    """Calculate azimuth from p1 to p2 (degrees from north, clockwise)."""
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    return np.degrees(np.arctan2(dx, dy)) % 360
+
+
+def angle_at_vertex(p1, p2, p3):
+    """
+    Calculate interior angle at vertex p2 using azimuth-based approach (like QGIS).
+    """
+    azimuth1 = azimuth(p1, p2)  # Direction of incoming edge
+    azimuth2 = azimuth(p2, p3)  # Direction of outgoing edge
+
+    if azimuth1 > azimuth2 and azimuth1 > azimuth2 + 180:
+        angle = 540 - azimuth1 + azimuth2
+    elif azimuth1 > azimuth2:
+        angle = 180 - azimuth1 + azimuth2
+    elif azimuth1 < azimuth2 and azimuth1 + 180 > azimuth2:
+        angle = 180 + azimuth2 - azimuth1
+    else:  # azimuth1 < azimuth2 and azimuth1 + 180 <= azimuth2
+        angle = azimuth2 - azimuth1 - 180
+
+    return angle
+
+
+def remove_spikes_by_angle(coords, min_angle=1.0):
+    """Remove vertices with angles below min_angle threshold."""
+    coords = list(coords)
+    if len(coords) < 4:
+        return coords
+
+    n = len(coords) - 1
+    cleaned = [
+        coords[i] for i in range(n)
+        if angle_at_vertex(coords[(i - 1) % n], coords[i], coords[(i + 1) % n]) >= min_angle
+    ]
+
+    # Make sure start/end vertice is
+    if cleaned and cleaned[0] != cleaned[-1]:
+        cleaned.append(cleaned[0])
+
+    return cleaned
+
+
+def remove_spikes_from_polygon(geom, min_angle=1.0):
+    """Remove spike vertices from polygon geometry."""
+    if isinstance(geom, Polygon):
+        exterior = remove_spikes_by_angle(geom.exterior.coords, min_angle)
+        interiors = [
+            remove_spikes_by_angle(ring.coords, min_angle)
+            for ring in geom.interiors
+        ]
+        interiors = [i for i in interiors if len(i) >= 4]
+
+        if len(exterior) >= 4:
+            return Polygon(exterior, interiors)
+        return None
+
+    elif isinstance(geom, MultiPolygon):
+        polys = [remove_spikes_from_polygon(p, min_angle) for p in geom.geoms]
+        polys = [p for p in polys if p is not None]
+        return MultiPolygon(polys) if polys else None
+
+    return geom
+
+
+def fix_spherical_geometries(features):
+    """
+    Check for spherically invalid geometries and attempt to auto-fix them.
+
+    Uses spherely to detect invalidity in spherical geometry (S2),
+    then applies four auto-fix steps:
+    1. Remove repeated points
+    2. Unary union
+    3. Minimal buffer
+    4. Minimal simplification
+
+    :param features: List of GeoJSON feature dicts
+    :return: List of features with fixed geometries
+    """
+    fixed_features = []
+    fixed_count = 0
+
+    for f in features:
+        geom = shape(f['geometry'])
+
+        # Check spherical validity
+        try:
+            spherely.from_wkt(geom.wkt)
+            # Valid - keep as is
+            fixed_features.append(f)
+        except RuntimeError:
+            # Invalid - attempt auto-fix
+            fixed_geom = remove_repeated_points(geom, 0.00001)
+            fixed_geom = unary_union(fixed_geom)
+            fixed_geom = fixed_geom.buffer(0.0000001)
+            fixed_geom = simplify(fixed_geom, 0.000009)
+            fixed_geom = fixed_geom.buffer(-0.00001).buffer(0.00001)
+
+            # Check if fix worked
+            try:
+                spherely.from_wkt(fixed_geom.wkt)
+                # Fixed successfully
+                new_feature = dict(f)
+                new_feature['geometry'] = mapping(fixed_geom)
+                fixed_features.append(new_feature)
+                fixed_count += 1
+            except RuntimeError:
+                # Still invalid - try spike removal on original planar geometry
+                fname = f.get('properties', {}).get('name', '?')
+                # print(f"\nProcessing feature: {fname}")
+                # print(f"  Exterior coords: {len(geom.exterior.coords) if hasattr(geom, 'exterior') else 'MultiPolygon'}")
+                spike_fixed_geom = remove_spikes_from_polygon(geom)
+                if spike_fixed_geom is not None:
+                    try:
+                        spherely.from_wkt(spike_fixed_geom.wkt)
+                        # Spike removal fixed it
+                        new_feature = dict(f)
+                        new_feature['geometry'] = mapping(spike_fixed_geom)
+                        fixed_features.append(new_feature)
+                        fixed_count += 1
+                        continue
+                    except RuntimeError:
+                        pass
+
+                # Still invalid - keep original and warn
+                print(f"Warning: Could not fix spherical geometry for feature "
+                      f"{f.get('properties', {}).get('id', '?')}")
+                fixed_features.append(f)
+
+    if fixed_count > 0:
+        print(f"Auto-fixed {fixed_count} spherically invalid geometries")
+
+    return fixed_features
 
 
 @dataclasses.dataclass
@@ -405,6 +674,15 @@ class Dataset(cldfbench.Dataset):
                     [maps[mname.strip()]['ID']
                      for mname in fi[pid].properties['map_name_full'].split('|')]
                 ))
+
+
+
+        # merge features by glottocode
+        features = merge_features_by_glottocode(features, check_only=False)
+
+        # fix spherically invalid geometries
+        features = fix_spherical_geometries(features)
+
         dump(
             feature_collection(
                 features,
