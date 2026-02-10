@@ -3,9 +3,9 @@ import argparse
 
 import pytest
 from cldfbench import CLDFWriter
-from shapely.geometry import shape, MultiPolygon, Point
 
-from pyglottography.dataset import Dataset, valid_geometry
+from pyglottography.dataset import (
+    Dataset, iter_merged_features_by_name_and_glottocode, merge_property_values, Move, FeatureSpec)
 
 
 @pytest.fixture
@@ -22,23 +22,6 @@ def dataset(tmprepos):
             fspec.write_text(fspec_content)
 
     return D()
-
-
-def test_valid_geometry():
-    geo = {  # A self-intersecting polygon, with a line sticking out.
-        'type': 'Polygon',
-        'coordinates': [[
-            [-1, 1],
-            [1, 1],
-            [0, 0],
-            [-1, -1],
-            [1, -1],
-            [-2, 2],
-        ]]
-    }
-    res = shape(valid_geometry(geo))
-    assert isinstance(res, MultiPolygon)
-    assert res.contains(Point(0, 0.5)) and res.contains(Point(0, -0.5))
 
 
 def test_Dataset_download_error(fixtures_dir, caplog):
@@ -70,8 +53,6 @@ def test_Dataset_download(mocker, glottolog, dataset):
 
 
 def test_Dataset_makecldf(dataset, mocker, glottolog):
-    import shutil
-
     dataset.cmd_download(argparse.Namespace(log=logging.getLogger(__name__)))
     dataset.etc_dir.joinpath('maps.csv').write_text('id,name\nfig,Figure 1')
 
@@ -83,3 +64,84 @@ def test_Dataset_makecldf(dataset, mocker, glottolog):
             writer=writer,
             log=logging.getLogger(__name__),
         ))
+
+
+def make_feature(topleft, bottomright, **props):
+    props.setdefault('id', '1')
+    props.setdefault('year', '2010')
+    return dict(
+        type='Feature',
+        properties=props,
+        geometry=dict(type='Polygon', coordinates= [
+                [
+                    [topleft[1], topleft[0]],
+                    [topleft[1], bottomright[0]],
+                    [bottomright[1], bottomright[0]],
+                    [bottomright[1], topleft[0]],
+                    [topleft[1], topleft[0]],
+                ]
+            ])
+    )
+
+
+def test_iter_merged():
+    # Needs a geometry and a couple different properties objects.
+    m = list(iter_merged_features_by_name_and_glottocode([
+        (1, make_feature((10, 20), (-10, 40), name='Name', year='x'), 'abcd1234'),
+        (1, make_feature((-5, 20), (-10, 50), name='Name', year='x'), 'abcd1234'),
+    ]))
+    assert len(m) == 1
+
+    m = list(iter_merged_features_by_name_and_glottocode([
+        (1, make_feature((10, 20), (-10, 40), name='Name', year='x'), 'abcd1234'),
+        (1, make_feature((-5, 20), (-10, 50), name='Näme', year='x'), 'abcd1234'),
+    ]))
+    assert len(m) == 2
+
+    m = list(iter_merged_features_by_name_and_glottocode([
+        (1,
+         make_feature(
+             (10, 20), (-10, 40),
+             name='Name',
+             year='x',
+             map_name_full='MName',
+             number_legend='2'
+         ),
+         'abcd1234'),
+        (1,
+         make_feature((-5, 20), (-10, 50), name='Name', year='x'),
+         'abcd1234'),
+    ]))
+    #print(m[0][1])
+    assert m[0][1]['properties']['maps']
+
+
+@pytest.mark.parametrize(
+    'values,expected',
+    [
+        (['a'], 'a'),
+        (['a', 'b'], 'a | b'),
+        (['b', 'a', 'b'], 'b | a'),
+        (['b', 'a | b'], 'b | a'),
+    ]
+)
+def test_merge_property_values(values, expected):
+    fgroup = [dict(properties=dict(n=v)) for v in values]
+    assert merge_property_values(fgroup, 'n') == expected
+
+
+def test_Move_force_multipolgon():
+    f = Move.force_multipolygon(dict(geometry=dict(type='Polygon', coordinates=1)))
+    assert f['geometry']['coordinates'] == [1]
+    assert f['geometry']['type'] == 'MultiPolygon'
+
+
+def test_FeatureSpec():
+    f1 = FeatureSpec.from_row(dict(id='1', name='n', year='y', glottocode='g', note='n'))
+    f2 = FeatureSpec.from_row(dict(id='2', name='n', year='y', glottocode='g', note='n'))
+    # We ignore the feature ID for equality comoparison:
+    assert f1 == f2
+    assert FeatureSpec.merged('x', [f1, f2]).properties['note'] == 'n'
+
+    f2.name = 'n2'
+    assert FeatureSpec.merged('x', [f1, f2], name='+').name == 'n+n2'

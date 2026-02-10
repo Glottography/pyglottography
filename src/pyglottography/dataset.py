@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import shutil
@@ -9,9 +10,8 @@ import collections
 import dataclasses
 
 from tqdm import tqdm
-import spherely
-from shapely import make_valid, difference, simplify, remove_repeated_points
-from shapely.geometry import shape, Point, MultiPolygon, Polygon, GeometryCollection, mapping
+from shapely import difference, simplify
+from shapely.geometry import shape, Point, MultiPolygon, Polygon, mapping
 from shapely.ops import unary_union
 from simplepybtex.database import parse_file
 from clldutils.path import ensure_cmd
@@ -21,12 +21,11 @@ from clldutils.markup import add_markdown_text
 import cldfbench
 from csvw.dsv import UnicodeWriter, reader
 from csvw.dsv_dialects import Dialect
-from cldfgeojson import MEDIA_TYPE, aggregate, feature_collection, merged_geometry
-from cldfgeojson.create import shapely_simplified_geometry, shapely_fixed_geometry
+from cldfgeojson import MEDIA_TYPE, aggregate, feature_collection
+from cldfgeojson.geometry import shapely_simplified_geometry, fixed_geometry, merged_geometry
 from pycldf.sources import Sources, Source
-import numpy as np
 
-from .util import Feature, bbox
+from .util import ReadonlyFeature, bbox
 
 OBSOLETE_PROPS = ['reference', 'map_image_file', 'url']
 
@@ -48,66 +47,32 @@ def get_one_source(p, bibkey=None) -> typing.Optional[typing.Tuple[Source, str]]
         return Source.from_entry(bibkey or key, entry), key
 
 
-def valid_geometry(geometry):
-    shp = shape(geometry)
-    if not shp.is_valid:  # We fix invalid geometries.
-        res = make_valid(shp)
-        if isinstance(res, GeometryCollection):
-            # The way shapely fixes MultiPolygon geomtries sometimes results in a
-            # GeometryCollection - the "main" geometry, and some things that may be
-            # pruned, like LineStrings or tiny Polygons.
-            res = [
-                s for s in res.geoms
-                if isinstance(s, (Polygon, MultiPolygon)) and s.area > 1e-15]
-            assert len(res) == 1
-            res = res[0]
-        assert isinstance(res, (Polygon, MultiPolygon)) and res.is_valid
-        geometry = res.__geo_interface__
-    return geometry
-
-
-def merge_features_by_glottocode(features, check_only=False):
+def iter_merged_features_by_name_and_glottocode(features):
     """Merge features sharing the same glottocode."""
     by_gc = collections.defaultdict(list)
-    no_gc = []
-    for f in features:
-        gc = f.get('properties', {}).get('cldf:languageReference')
-        if gc:
-            by_gc[gc].append(f)
-        else:
-            no_gc.append(f)
-
-    # Check for duplicates
-    duplicates = {gc: len(group) for gc, group in by_gc.items() if len(group) > 1}
-
-    if check_only:
-        if duplicates:
-            print(f"Found {len(duplicates)} glottocodes with multiple features: {duplicates}")
-            return True
-        else:
-            print("No duplicate glottocodes")
-            return False
+    for fid, f, gc in features:
+        by_gc[f['properties']['name'], gc, f['properties']['year']].append(f)
 
     # Merge each group
     merged = []
-    for gc, group in by_gc.items():
+    for (name, gc, year), group in by_gc.items():
+        fids = [f['properties']['id'] for f in group]
         if len(group) == 1:
-            merged.append(group[0])
+            merged.append((group[0], gc, fids))
         else:
-            geoms = [shape(f['geometry']) for f in group]
-            merged_geom = unary_union(geoms)
-            new_feature = dict(group[0])
+            merged_geom = unary_union([shape(f['geometry']) for f in group])
+            new_feature = copy.copy(group[0])
             new_feature['geometry'] = mapping(merged_geom)
 
             # Merge properties that may differ across features
             new_feature['properties'] = dict(new_feature['properties'])
             new_feature['properties']['name'] = merge_property_values(group, 'name')
-            new_feature['properties']['year'] = merge_property_values(group, 'year')
+            new_feature['properties']['year'] = year
 
             # Check if any feature has number_legend - if so, merge map and legend as pairs
             has_legend = any(f['properties'].get('number_legend') for f in group)
             if has_legend:
-                merged_maps, merged_legends = merge_map_and_legend(group)
+                merged_maps, merged_legends, _ = merge_map_and_legend_and_note(group)
                 new_feature['properties']['map_name_full'] = merged_maps
                 new_feature['properties']['number_legend'] = merged_legends
 
@@ -119,56 +84,51 @@ def merge_features_by_glottocode(features, check_only=False):
                 new_feature['properties']['maps'] = [
                     '{} [{}]'.format(m, lg) for m, lg in zip(map_list, legend_list)]
             else:
-                new_feature['properties']['map_name_full'] = merge_property_values(group, 'map_name_full')
+                new_feature['properties']['map_name_full'] = merge_property_values(
+                    group, 'map_name_full')
 
-            shapely_fixed_geometry(new_feature)
-            merged.append(new_feature)
+            fixed_geometry(new_feature)
+            merged.append((new_feature, gc, fids))
 
     # Re-enumerate IDs after merging
-    result = merged + no_gc
-    for i, f in enumerate(result, start=1):
+    for i, (f, gc, fids) in enumerate(merged, start=1):
         f['properties']['id'] = str(i)
-
-    return result
+        fixed_geometry(f)
+        yield str(i), f, gc, fids
 
 
 def merge_property_values(group, prop_name):
     """Merge property values from multiple features, concatenating unique values with ' | '."""
-    values = [f['properties'].get(prop_name, '') for f in group]
-
-    # Check if all values are the same
-    if len(set(values)) == 1:
-        return values[0]
-
-    # Split all values by "|", collect unique entries
-    all_entries = []
-    for v in values:
-        entries = [e.strip() for e in str(v).split('|')]
-        all_entries.extend(entries)
-
     # Remove duplicates while preserving order
     seen = set()
     unique = []
-    for entry in all_entries:
-        if entry and entry not in seen:
-            seen.add(entry)
-            unique.append(entry)
+    for f in group:
+        v = f['properties'].get(prop_name, '')
+        for entry in [e.strip() for e in str(v).split('|')]:
+            if entry and entry not in seen:
+                seen.add(entry)
+                unique.append(entry)
 
     return ' | '.join(unique)
 
 
-def merge_map_and_legend(group):
+def merge_map_and_legend_and_note(group):
     """
     Merge map_name_full and number_legend as paired values.
 
     Each entry in map_name_full corresponds positionally to an entry in number_legend.
     When merging, we keep these pairs together and deduplicate based on the pair.
     """
+    def get_prop(o, prop):
+        props = getattr(o, 'properties', None) or o['properties']
+        return str(props.get(prop, ''))
+
     # Collect all (map, legend) pairs from all features
-    all_pairs = []
+    all_pairs, notes = [], set()
     for f in group:
-        maps = [m.strip() for m in str(f['properties'].get('map_name_full', '')).split('|')]
-        legends = [lg.strip() for lg in str(f['properties'].get('number_legend', '')).split('|')]
+        maps = [m.strip() for m in get_prop(f, 'map_name_full').split('|')]
+        legends = [lg.strip() for lg in get_prop(f, 'number_legend').split('|')]
+        notes.add(get_prop(f, 'note'))
 
         # Pad legends if shorter than maps
         while len(legends) < len(maps):
@@ -187,149 +147,11 @@ def merge_map_and_legend(group):
             unique_pairs.append(pair)
 
     if not unique_pairs:
-        return '', ''
+        return '', '', '; '.join(sorted(notes))
 
     merged_maps = ' | '.join(p[0] for p in unique_pairs)
     merged_legends = ' | '.join(p[1] for p in unique_pairs)
-
-    return merged_maps, merged_legends
-
-
-def azimuth(p1, p2):
-    """Calculate azimuth from p1 to p2 (degrees from north, clockwise)."""
-    dx = p2[0] - p1[0]
-    dy = p2[1] - p1[1]
-    return np.degrees(np.arctan2(dx, dy)) % 360
-
-
-def angle_at_vertex(p1, p2, p3):
-    """
-    Calculate interior angle at vertex p2 using azimuth-based approach (like QGIS).
-    """
-    azimuth1 = azimuth(p1, p2)  # Direction of incoming edge
-    azimuth2 = azimuth(p2, p3)  # Direction of outgoing edge
-
-    if azimuth1 > azimuth2 and azimuth1 > azimuth2 + 180:
-        angle = 540 - azimuth1 + azimuth2
-    elif azimuth1 > azimuth2:
-        angle = 180 - azimuth1 + azimuth2
-    elif azimuth1 < azimuth2 and azimuth1 + 180 > azimuth2:
-        angle = 180 + azimuth2 - azimuth1
-    else:  # azimuth1 < azimuth2 and azimuth1 + 180 <= azimuth2
-        angle = azimuth2 - azimuth1 - 180
-
-    return angle
-
-
-def remove_spikes_by_angle(coords, min_angle=1.0):
-    """Remove vertices with angles below min_angle threshold."""
-    coords = list(coords)
-    if len(coords) < 4:
-        return coords
-
-    n = len(coords) - 1
-    cleaned = [
-        coords[i] for i in range(n)
-        if angle_at_vertex(coords[(i - 1) % n], coords[i], coords[(i + 1) % n]) >= min_angle
-    ]
-
-    # Make sure start/end vertice is
-    if cleaned and cleaned[0] != cleaned[-1]:
-        cleaned.append(cleaned[0])
-
-    return cleaned
-
-
-def remove_spikes_from_polygon(geom, min_angle=1.0):
-    """Remove spike vertices from polygon geometry."""
-    if isinstance(geom, Polygon):
-        exterior = remove_spikes_by_angle(geom.exterior.coords, min_angle)
-        interiors = [
-            remove_spikes_by_angle(ring.coords, min_angle)
-            for ring in geom.interiors
-        ]
-        interiors = [i for i in interiors if len(i) >= 4]
-
-        if len(exterior) >= 4:
-            return Polygon(exterior, interiors)
-        return None
-
-    elif isinstance(geom, MultiPolygon):
-        polys = [remove_spikes_from_polygon(p, min_angle) for p in geom.geoms]
-        polys = [p for p in polys if p is not None]
-        return MultiPolygon(polys) if polys else None
-
-    return geom
-
-
-def fix_spherical_geometries(features):
-    """
-    Check for spherically invalid geometries and attempt to auto-fix them.
-
-    Uses spherely to detect invalidity in spherical geometry (S2),
-    then applies four auto-fix steps:
-    1. Remove repeated points
-    2. Unary union
-    3. Minimal buffer
-    4. Minimal simplification
-
-    :param features: List of GeoJSON feature dicts
-    :return: List of features with fixed geometries
-    """
-    fixed_features = []
-    fixed_count = 0
-
-    for f in features:
-        geom = shape(f['geometry'])
-
-        # Check spherical validity
-        try:
-            spherely.from_wkt(geom.wkt)
-            # Valid - keep as is
-            fixed_features.append(f)
-        except RuntimeError:
-            # Invalid - attempt auto-fix
-            fixed_geom = remove_repeated_points(geom, 0.00001)
-            fixed_geom = unary_union(fixed_geom)
-            fixed_geom = fixed_geom.buffer(0.0000001)
-            fixed_geom = simplify(fixed_geom, 0.000009)
-            fixed_geom = fixed_geom.buffer(-0.00001).buffer(0.00001)
-
-            # Check if fix worked
-            try:
-                spherely.from_wkt(fixed_geom.wkt)
-                # Fixed successfully
-                new_feature = dict(f)
-                new_feature['geometry'] = mapping(fixed_geom)
-                fixed_features.append(new_feature)
-                fixed_count += 1
-            except RuntimeError:
-                # Still invalid - try spike removal on original planar geometry
-                fname = f.get('properties', {}).get('name', '?')
-                # print(f"\nProcessing feature: {fname}")
-                # print(f"  Exterior coords: {len(geom.exterior.coords) if hasattr(geom, 'exterior') else 'MultiPolygon'}")
-                spike_fixed_geom = remove_spikes_from_polygon(geom)
-                if spike_fixed_geom is not None:
-                    try:
-                        spherely.from_wkt(spike_fixed_geom.wkt)
-                        # Spike removal fixed it
-                        new_feature = dict(f)
-                        new_feature['geometry'] = mapping(spike_fixed_geom)
-                        fixed_features.append(new_feature)
-                        fixed_count += 1
-                        continue
-                    except RuntimeError:
-                        pass
-
-                # Still invalid - keep original and warn
-                print(f"Warning: Could not fix spherical geometry for feature "
-                      f"{f.get('properties', {}).get('id', '?')}")
-                fixed_features.append(f)
-
-    if fixed_count > 0:
-        print(f"Auto-fixed {fixed_count} spherically invalid geometries")
-
-    return fixed_features
+    return merged_maps, merged_legends, '; '.join(sorted(notes))
 
 
 @dataclasses.dataclass
@@ -344,25 +166,83 @@ class FeatureSpec:
     year: str
     glottocode: typing.Optional[str]
     properties: collections.OrderedDict
+    # We want to keep track of how features relate to the "raw" data, i.e. polygons in
+    # raw/dataset.geojson and metadata in etc/features.csv.
+    raw_ids: typing.List[str] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_row(cls, row):
-        return cls(
-            id=row.pop('id'),
+        res = cls(
+            id=row['id'],
             name=row.pop('name'),
             year=row.pop('year'),
             glottocode=row.pop('glottocode') or None,
             properties=row,
+            raw_ids=[row.pop('id')],
         )
+        res.normalize()
+        return res
 
-    def as_row(self):
+    def normalize(self):
+        maps = [s.strip() for s in self.map_name_full.split('|')]
+        numbers = [s.strip() for s in self.number_legend.split('|')]
+        if set(numbers) == {''}:
+            numbers = []
+        if maps and numbers:
+            assert len(maps) == len(numbers), '{}; {}'.format(maps, numbers)
+        self.properties['map_name_full'] = ' | '.join(maps)
+        self.properties['number_legend'] = ' | '.join(numbers)
+        self.properties['maps'] = ['{} [{}]'.format(m, n) for m, n in zip(maps, numbers)]
+
+    @classmethod
+    def merged(cls, fid, specs, **merge_attrs):
+        atts = {}
+        for att in ['year', 'name', 'glottocode']:
+            if att in merge_attrs:
+                atts[att] = merge_attrs[att].join(
+                    sorted({getattr(spec, att) or '' for spec in specs}))
+            else:
+                assert 1 == len({getattr(spec, att) for spec in specs}), (
+                    "{}".format([getattr(spec, att) for spec in specs]))
+                atts[att] = getattr(specs[0], att)
+
+        res = cls(
+            id=fid,
+            properties=collections.OrderedDict(),
+            raw_ids=list(itertools.chain(*[spec.raw_ids for spec in specs])),
+            **atts,
+        )
+        m, l, n = merge_map_and_legend_and_note(specs)
+        res.properties['map_name_full'] = m
+        res.properties['number_legend'] = l
+        if n:
+            res.properties['note'] = n
+        res.normalize()
+        return res
+
+    def as_row(self, omit=None):
+        omit = omit or []
+        omit.append('raw_ids')
         res = collections.OrderedDict()
         for field in dataclasses.fields(self):
+            if field.name in omit:
+                continue
             if field.name == 'properties':
                 res.update(getattr(self, field.name))
             else:
                 res[field.name] = getattr(self, field.name) or ''
         return res
+
+    @property
+    def map_name_full(self):
+        return self.properties.get('map_name_full') or ''
+
+    @property
+    def number_legend(self):
+        return self.properties.get('number_legend') or ''
+
+    def __eq__(self, other):
+        return self.as_row(omit=['id']) == other.as_row(omit=['id'])
 
 
 def recompute_shape(row, featuredict, feature_specs):
@@ -395,7 +275,7 @@ def recompute_shape(row, featuredict, feature_specs):
         f['geometry'] = featuredict[row['replace']]['geometry']
     if not f['geometry']['coordinates']:
         raise ValueError()  # pragma: no cover
-    assert Feature(f).shape, f['properties']
+    assert ReadonlyFeature(f).shape, f['properties']
 
 
 class Move:
@@ -408,12 +288,17 @@ class Move:
         self.point = Point(float(row['longitude']), float(row['latitude']))
         self.poly = None
 
-    def extracted(self, feature):
-        assert feature['properties']['id'] == self.source, 'expected {} gor {}'.format(
-            self.source, feature['properties']['id'])
+    @staticmethod
+    def force_multipolygon(feature):
         if feature['geometry']['type'] == 'Polygon':
             feature['geometry']['type'] = 'MultiPolygon'
             feature['geometry']['coordinates'] = [feature['geometry']['coordinates']]
+        return feature
+
+    def extracted(self, feature):
+        assert feature['properties']['id'] == self.source, 'expected {} gor {}'.format(
+            self.source, feature['properties']['id'])
+        feature = self.force_multipolygon(feature)
         assert feature['geometry']['type'] == 'MultiPolygon', feature['geometry']['type']
         for i, poly in enumerate(feature['geometry']['coordinates']):
             if shape(dict(type='Polygon', coordinates=poly)).contains(self.point):
@@ -426,13 +311,11 @@ class Move:
 
     def append(self, feature):
         assert self.poly
-        if feature['geometry']['type'] == 'Polygon':
-            feature['geometry']['type'] = 'MultiPolygon'
-            feature['geometry']['coordinates'] = [feature['geometry']['coordinates']]
+        feature = self.force_multipolygon(feature)
         feature['geometry']['coordinates'].append(self.poly)
         shp = shape(feature['geometry'])
         if not shp.is_valid:  # pragma: no cover
-            shapely_fixed_geometry(feature)
+            fixed_geometry(feature)
 
 
 class Dataset(cldfbench.Dataset):
@@ -464,6 +347,8 @@ class Dataset(cldfbench.Dataset):
 
     def iter_features(self):
         """
+        Reads "raw" data, i.e. geojson from raw/dataset.geojson and metadata from etc/features.csv.
+
         Three error correction mechanisms are implemented:
         - recomputing the geometries of features (from geometries of other features),
         - moving polygons between features.
@@ -522,12 +407,12 @@ class Dataset(cldfbench.Dataset):
             if spec.glottocode:
                 f['properties']['cldf:languageReference'] = spec.glottocode
             f['properties'].update(spec.properties)
-            yield (fid, Feature(f), spec.glottocode)
+            yield (fid, ReadonlyFeature(f), spec.glottocode)
 
         for fid, items in fixpolys.items():
             spec = fi[fid]
             yield (fid,
-                   Feature(dict(
+                   ReadonlyFeature(dict(
                        type='Feature',
                        properties=spec.as_row(),
                        geometry=dict(type='MultiPolygon', coordinates=[m.poly for m in items]))),
@@ -537,11 +422,20 @@ class Dataset(cldfbench.Dataset):
 
     @functools.cached_property
     def features(self):
-        return list(self.iter_features())
+        """
+        Merges features based on same name and glottocode, re-assigns serial identifiers.
+
+        :return:
+        """
+        fi = self.feature_inventory
+        res = []
+        for fid, f, gc, fids in iter_merged_features_by_name_and_glottocode(self.iter_features()):
+            res.append((fid, f, gc, FeatureSpec.merged(fid, [fi[ff] for ff in fids])))
+        return res
 
     @functools.cached_property
     def bounds(self):
-        res = bbox([f for _, f, _ in self.features])
+        res = bbox([f for _, f, _, _ in self.features])
         return (
             math.floor(res[0] * 10) / 10,
             math.floor(res[1] * 10) / 10,
@@ -554,7 +448,7 @@ class Dataset(cldfbench.Dataset):
         coords = [[
             (minlon, minlat), (minlon, maxlat), (maxlon, maxlat), (maxlon, minlat), (minlon, minlat)
         ]]
-        return Feature.from_geometry(dict(type='Polygon', coordinates=coords))
+        return ReadonlyFeature.from_geometry(dict(type='Polygon', coordinates=coords))
 
     def cmd_download(self, args):
         """
@@ -608,7 +502,7 @@ class Dataset(cldfbench.Dataset):
                 for prop in OBSOLETE_PROPS:
                     f['properties'].pop(prop, None)
                 features[f['properties']['id']] = f
-                f['geometry'] = valid_geometry(f['geometry'])
+                fixed_geometry(f)
 
         geometries = [
             shape(f['geometry']) for f in load(self.raw_dir / 'dataset.geojson')['features']]
@@ -645,7 +539,6 @@ class Dataset(cldfbench.Dataset):
         self.local_schema(args.writer.cldf)
         args.writer.cldf.add_sources(*Sources.from_file(self.etc_dir / "sources.bib"))
         features = []
-        fi = self.feature_inventory
         maps, with_maps = {}, False
         if self.etc_dir.joinpath('maps.csv').exists():
             with_maps = True
@@ -653,35 +546,34 @@ class Dataset(cldfbench.Dataset):
                 args.writer.objects['ContributionTable'].append(
                     self.make_contribution_map(args, maps, r))
 
-        for pid, f, gc in self.features:
+        #
+        # FIXME: fi must be merged as well!
+        #
+
+        for pid, f, gc, spec in self.features:
             if not with_maps:
-                if fi[pid].properties['map_name_full'] not in maps:
-                    args.writer.objects['ContributionTable'].append(self.make_contribution_map(
-                        args,
-                        maps,
-                        {},
-                        id='map_{}'.format(len(maps) + 1),
-                        name=fi[pid].properties['map_name_full']))
+                for mname in spec.properties['map_name_full'].split('|'):
+                    mname = mname.strip()
+                    if mname not in maps:
+                        args.writer.objects['ContributionTable'].append(self.make_contribution_map(
+                            args,
+                            maps,
+                            {},
+                            id='map_{}'.format(len(maps) + 1),
+                            name=mname))
             f = self.make_feature(args, f)
-            features.append(shapely_fixed_geometry(f))
+            features.append(fixed_geometry(f))
             args.writer.objects['ContributionTable'].append(
                 self.make_contribution_feature(
                     args,
                     pid,
                     gc,
                     f,
-                    fi[pid],
+                    spec,
                     [maps[mname.strip()]['ID']
-                     for mname in fi[pid].properties['map_name_full'].split('|')]
+                     for mname in spec.properties['map_name_full'].split('|')
+                     if mname.strip() in maps]
                 ))
-
-
-
-        # merge features by glottocode
-        features = merge_features_by_glottocode(features, check_only=False)
-
-        # fix spherically invalid geometries
-        features = fix_spherical_geometries(features)
 
         dump(
             feature_collection(
@@ -704,7 +596,7 @@ class Dataset(cldfbench.Dataset):
                 ('dialects' if ptype == 'dialect' else 'families')
             p = self.cldf_dir / '{}.geojson'.format(label)
             features, languages = aggregate(
-                [(pid, f, gc) for pid, f, gc in self.features if gc],
+                [(pid, f, gc) for pid, f, gc, _ in self.features if gc],
                 args.glottolog.api,
                 level=ptype,
                 buffer=self._buffer,
@@ -714,7 +606,7 @@ class Dataset(cldfbench.Dataset):
                 # too big. If it would get close to 1MB, we simplify the geometry.
                 for f in features:
                     if len(json.dumps(f)) > 1000000:  # pragma: no cover
-                        shapely_fixed_geometry(shapely_simplified_geometry(f))
+                        fixed_geometry(shapely_simplified_geometry(f))
             dump(
                 feature_collection(
                     features,
@@ -750,7 +642,7 @@ class Dataset(cldfbench.Dataset):
                 *self.bounds))
         assert args.writer.cldf.sources
 
-    def make_feature(self, args, f: Feature) -> Feature:
+    def make_feature(self, args, f: ReadonlyFeature) -> ReadonlyFeature:
         """
         Derived datasets can override this method to customize the GeoJSON feature objects form
         the source data.
@@ -801,7 +693,7 @@ class Dataset(cldfbench.Dataset):
                                   args,
                                   pid: str,
                                   gc: typing.Optional[str],
-                                  f: Feature,
+                                  f: ReadonlyFeature,
                                   fmd: FeatureSpec,
                                   map_ids: typing.List[str]) -> dict:
         """
@@ -810,7 +702,7 @@ class Dataset(cldfbench.Dataset):
         """
         return dict(
             ID=pid,
-            Name=f.properties['name'],
+            Name=f['properties']['name'],
             Glottocode=gc or None,
             Source=[self.id],
             Media_IDs=['features'],
@@ -923,13 +815,13 @@ class Dataset(cldfbench.Dataset):
             f = json.dumps(self.bounding_box_as_feature())
         else:
             max_geojson_len = getattr(args, 'max_geojson_len', 10000)
-            shp = shape(merged_geometry([f for _, f, _ in self.features]))
-            f = json.dumps(Feature.from_geometry(shp))
+            shp = shape(merged_geometry([f for _, f, _, _ in self.features]))
+            f = json.dumps(ReadonlyFeature.from_geometry(shp))
             if len(f) < 10 * max_geojson_len:
                 tolerance = 0
                 while len(f) > max_geojson_len and tolerance < 0.8:
                     tolerance += 0.1
-                    f = json.dumps(Feature.from_geometry(simplify(shp, tolerance)))
+                    f = json.dumps(ReadonlyFeature.from_geometry(simplify(shp, tolerance)))
             if len(f) > max_geojson_len:
                 # Fall back to just a rectangle built from the bounding box.
                 f = json.dumps(self.bounding_box_as_feature())
