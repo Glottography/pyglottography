@@ -1,6 +1,13 @@
 # Changes
 
 
+## [2.0.0] - 2026-02-10
+
+`pyglottography` now uses `cldfgeojson` 2.x to make sure all geometries in datasets
+are valid on the sphere as well as on the cartesian plane. We also now merge "raw"
+features with same label/name and Glottocode, when creating cldf/features.geojson.
+
+
 ## [1.1.0] - 2025-10-12
 
 - Fixed bug whereby invalid geometries might have been created for families due to
