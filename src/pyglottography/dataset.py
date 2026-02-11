@@ -60,7 +60,7 @@ def iter_merged_features_by_name_and_glottocode(features):
         if len(group) == 1:
             merged.append((group[0], gc, fids))
         else:
-            merged_geom = unary_union([shape(f['geometry']) for f in group])
+            merged_geom = unary_union([shape(fixed_geometry(f)['geometry']) for f in group])
             new_feature = copy.copy(group[0])
             new_feature['geometry'] = mapping(merged_geom)
 

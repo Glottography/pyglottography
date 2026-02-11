@@ -1,6 +1,11 @@
 # Changes
 
 
+## [2.0.1] - 2026-02-11
+
+We must make sure to only use valid geometries in operations such as `unary_union`.
+
+
 ## [2.0.0] - 2026-02-10
 
 `pyglottography` now uses `cldfgeojson` 2.x to make sure all geometries in datasets
