@@ -1,6 +1,12 @@
 # Changes
 
 
+## [2.0.3] - 2026-02-11
+
+Use metadata from `metadata.json` when creating release info, rather than from
+the CLDF dataset, because there might be more than one of these (see `asher2007world`).
+
+
 ## [2.0.2] - 2026-02-11
 
 Make sure release instructions as output by `cldfbench glottography.release` work
