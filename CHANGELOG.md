@@ -1,6 +1,12 @@
 # Changes
 
 
+## [2.0.2] - 2026-02-11
+
+Make sure release instructions as output by `cldfbench glottography.release` work
+when copy-pasted to the commandline.
+
+
 ## [2.0.1] - 2026-02-11
 
 We must make sure to only use valid geometries in operations such as `unary_union`.

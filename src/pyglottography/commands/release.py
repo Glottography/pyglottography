@@ -26,7 +26,7 @@ and the Glottography dataset as
 DOI""".format(cldf.properties['dc:bibliographicCitation']),
         encoding='utf8')
     print('gh release create {} --title "{}" --notes-file relnotes.txt'.format(
-        tag, cldf.properties['dc:title']))
+        tag, cldf.properties['dc:title'].replace('"', r'\"')))
     print('')
     print("Now you should grab the Zenodo version DOI from\n"
           "https://zenodo.org/account/settings/github/repository/Glottography/{0}\n"
